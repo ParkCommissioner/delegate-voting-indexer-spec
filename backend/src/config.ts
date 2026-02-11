@@ -8,7 +8,7 @@ export interface Config {
 }
 
 export function getConfig(): Config {
-  const rpcUrl = process.env.KATANA_RPC_URL || 'https://rpc.katana.cartridge.gg';
+  const rpcUrl = process.env.KATANA_RPC_URL || 'https://rpc.katana.network';
   const supabaseUrl = process.env.SUPABASE_URL || '';
   const supabaseKey = process.env.SUPABASE_ANON_KEY || '';
 

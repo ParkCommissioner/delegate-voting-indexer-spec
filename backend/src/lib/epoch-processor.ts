@@ -17,7 +17,7 @@ import {
 } from './snapshot-resolver.js';
 import { fetchEventsForEpoch, fetchDelegationEventsUpTo } from './event-fetcher.js';
 import { identifyActiveVoters, getResetVoters } from './voter-identifier.js';
-import { reconstructDelegationState } from './delegation-state.js';
+import { reconstructDelegationState, getDelegatedTokens } from './delegation-state.js';
 import { decomposeAllVotes, aggregateByGauge, aggregateByDelegate } from './vote-decomposer.js';
 import { getTokenVotingPower } from './voting-power.js';
 import { runAllInvariantChecks, summarizeResults, type InvariantResult } from './invariants.js';
@@ -97,7 +97,10 @@ export async function processEpoch(
   const delegateAggregates = aggregateByDelegate(contributions);
 
   // Run invariant checks
+  // When enableUpdateVotingPowerHook=true, votes are stored at epoch 0
+  const writeEpochId = enableUpdateVotingPowerHook ? 0 : epochId;
   console.log('  Running invariant checks...');
+  console.log(`    Write epoch for contract queries: ${writeEpochId}`);
   const invariantResults = await runAllInvariantChecks(
     epochId,
     activeVoters,
@@ -105,7 +108,8 @@ export async function processEpoch(
     delegationState,
     contributions,
     snapshotTimestamp,
-    getTokenVotingPower
+    getTokenVotingPower,
+    writeEpochId
   );
 
   const summary = summarizeResults(invariantResults);
@@ -146,7 +150,8 @@ export async function processEpoch(
     if (seenDelegators.has(contribution.delegator)) continue;
     seenDelegators.add(contribution.delegator);
 
-    const tokenIds: number[] = []; // Would need to track this in decomposition
+    // Get the token IDs delegated from this delegator to their delegate
+    const tokenIds = getDelegatedTokens(delegationState, contribution.delegator, contribution.delegate);
 
     delegations.push({
       epochId,

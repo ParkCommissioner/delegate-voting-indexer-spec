@@ -23,14 +23,17 @@ export interface InvariantResult {
 
 // Invariant 1: Total Vote Power Consistency
 // Sum of all Voted event power (after removing Reset users) must equal contract total
+// When enableUpdateVotingPowerHook=true, votes are stored at epoch 0, so writeEpochId should be 0
 export async function checkTotalVotePowerConsistency(
   epochId: EpochId,
-  activeVoters: Map<Address, VoterState>
+  activeVoters: Map<Address, VoterState>,
+  writeEpochId?: EpochId
 ): Promise<InvariantResult> {
   const gaugeVoter = getGaugeVoterContract();
+  const queryEpoch = writeEpochId ?? epochId;
 
   try {
-    const contractTotal = await gaugeVoter.epochTotalVotingPowerCast(epochId);
+    const contractTotal = await gaugeVoter.epochTotalVotingPowerCast(queryEpoch);
     const indexedTotal = Array.from(activeVoters.values()).reduce((sum, voter) => {
       return sum + voter.gaugesVotedFor.reduce((s, g) => s + g.votes, 0n);
     }, 0n);
@@ -40,6 +43,7 @@ export async function checkTotalVotePowerConsistency(
       passed: contractTotal === indexedTotal,
       expected: contractTotal.toString(),
       actual: indexedTotal.toString(),
+      details: `Queried epoch ${queryEpoch}`,
     };
   } catch (error) {
     return {
@@ -52,16 +56,19 @@ export async function checkTotalVotePowerConsistency(
 
 // Invariant 2: Per-Gauge Vote Consistency
 // For each gauge, sum of votes must equal gauge total in contract
+// When enableUpdateVotingPowerHook=true, votes are stored at epoch 0, so writeEpochId should be 0
 export async function checkPerGaugeVoteConsistency(
   epochId: EpochId,
-  activeVoters: Map<Address, VoterState>
+  activeVoters: Map<Address, VoterState>,
+  writeEpochId?: EpochId
 ): Promise<InvariantResult[]> {
   const gaugeVoter = getGaugeVoterContract();
+  const queryEpoch = writeEpochId ?? epochId;
   const results: InvariantResult[] = [];
 
   for (const gauge of GAUGES) {
     try {
-      const contractGaugeTotal = await gaugeVoter.epochGaugeVotes(epochId, gauge);
+      const contractGaugeTotal = await gaugeVoter.epochGaugeVotes(queryEpoch, gauge);
 
       let indexedGaugeTotal = 0n;
       for (const voter of activeVoters.values()) {
@@ -76,6 +83,7 @@ export async function checkPerGaugeVoteConsistency(
         passed: contractGaugeTotal === indexedGaugeTotal,
         expected: contractGaugeTotal.toString(),
         actual: indexedGaugeTotal.toString(),
+        details: `Queried epoch ${queryEpoch}`,
       });
     } catch (error) {
       results.push({
@@ -205,6 +213,7 @@ export function checkNonVoterExclusion(
 }
 
 // Run all invariant checks for an epoch
+// writeEpochId: When enableUpdateVotingPowerHook=true, pass 0; otherwise pass epochId or omit
 export async function runAllInvariantChecks(
   epochId: EpochId,
   activeVoters: Map<Address, VoterState>,
@@ -212,15 +221,16 @@ export async function runAllInvariantChecks(
   delegationState: DelegationState,
   contributions: DelegatorContribution[],
   snapshotTimestamp: number,
-  tokenVotingPowerFn: (tokenId: TokenId, timestamp: number) => Promise<bigint>
+  tokenVotingPowerFn: (tokenId: TokenId, timestamp: number) => Promise<bigint>,
+  writeEpochId?: EpochId
 ): Promise<InvariantResult[]> {
   const results: InvariantResult[] = [];
 
   // Invariant 1
-  results.push(await checkTotalVotePowerConsistency(epochId, activeVoters));
+  results.push(await checkTotalVotePowerConsistency(epochId, activeVoters, writeEpochId));
 
   // Invariant 2
-  const gaugeResults = await checkPerGaugeVoteConsistency(epochId, activeVoters);
+  const gaugeResults = await checkPerGaugeVoteConsistency(epochId, activeVoters, writeEpochId);
   results.push(...gaugeResults);
 
   // Invariant 3 - for each active delegate

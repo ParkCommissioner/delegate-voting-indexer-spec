@@ -175,10 +175,11 @@ function renderStatsGrid(stats) {
 
 function renderGaugeCard(gauge, epochId, index) {
   const color = getGaugeColor(index);
+  const rank = index + 1;
   return `
     <a href="#/epochs/${epochId}/gauges/${gauge.gaugeAddress}" class="gauge-card">
       <div class="gauge-header">
-        <span class="gauge-name">${formatGaugeName(gauge.gaugeAddress)}</span>
+        <span class="gauge-name"><span class="gauge-rank">${rank}</span>${formatGaugeName(gauge.gaugeAddress)}</span>
         <span class="gauge-percent">${formatPercent(gauge.percentage)}</span>
       </div>
       <div class="gauge-bar">

@@ -2,9 +2,7 @@
 
 ## Overview
 
-This specification describes an indexing service for Aragon's ve-governance system. The indexer decomposes delegate votes into per-delegator contributions.
-
-When a delegate votes on a gauge, their voting power may include delegated power from multiple token holders. The indexer attributes each vote back to the original token holders. This enables accurate reward distribution: the owner gets rewards, regardless of who casts the vote.
+This specification describes an indexing service for Aragon's ve-governance system that decomposes delegate voting into per-delegator contributions. When a delegate votes on a gauge, their voting power may include delegated power from multiple token holders. This indexer attributes each vote back to the original token holders, enabling accurate reward distribution where "owner gets rewards" — regardless of who actually casts the vote.
 
 ---
 
@@ -44,7 +42,7 @@ When a delegate votes on a gauge, their voting power may include delegated power
 
 ## Critical Configuration: `enableUpdateVotingPowerHook`
 
-The AddressGaugeVoter contract has a configuration flag that changes how voting power is determined and how votes persist:
+The AddressGaugeVoter contract has a critical configuration flag that fundamentally changes how voting power is determined and how votes persist:
 
 ```solidity
 bool public enableUpdateVotingPowerHook;  // AddressGaugeVoter.sol:60
@@ -60,27 +58,27 @@ bool public enableUpdateVotingPowerHook;  // AddressGaugeVoter.sol:60
 | **Double-Vote Protection** | Built-in (VP locked at epoch start) | Requires `updateVotingPower` hook |
 | **Late Delegation Effect** | No effect (VP already locked) | No auto-update; delegate must re-vote |
 
-**Contract source**: `AddressGaugeVoter.sol:119-146`
+**Contract source**: `AddressGaugeVoter.sol:119-146` (detailed comment explaining the security rationale)
 
 ### Which Mode to Use
 
-**`enableUpdateVotingPowerHook = false`** (recommended):
-- Prevents double-voting attacks when tokens transfer mid-epoch
+**`enableUpdateVotingPowerHook = false`** (RECOMMENDED for security):
+- Prevents double-voting attacks where tokens are transferred mid-epoch
 - Voting power is deterministic at epoch start
-- Simpler indexer logic: query `getPastVotes` at epoch start
+- Simpler indexer logic — just query `getPastVotes` at epoch start
 
 **`enableUpdateVotingPowerHook = true`**:
 - Required if the underlying token cannot call `updateVotingPower` on transfers
 - Allows votes to persist across epochs without re-voting
-- Requires careful handling of delegation changes
+- More complex, requires careful handling of delegation changes
 
-**For indexer**: Query the on-chain value of `enableUpdateVotingPowerHook` at startup. The algorithms in this spec support both modes.
+**For indexer**: Query the on-chain value of `enableUpdateVotingPowerHook` at startup and use the appropriate logic. The algorithms in this spec support both modes.
 
 ---
 
 ## System Architecture
 
-The ve-governance system uses these contracts:
+The ve-governance system consists of several interconnected contracts:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -183,16 +181,19 @@ Token holders delegate their veNFTs to a delegate (which can be themselves):
 
 **Key delegation functions**:
 
-1. **`delegate(address _delegatee)`** — Delegates all owned tokens to a new delegatee. If tokens were previously delegated, they are first undelegated. Source: `EscrowIVotesAdapter.sol:170-191`
+1. **`delegate(address _delegatee)`** — Delegates all owned tokens to a new delegatee. If tokens were previously delegated, they are first undelegated.
+   - Source: `EscrowIVotesAdapter.sol:170-191`
 
-2. **`delegate(uint256[] _tokenIds)`** — Delegates specific tokens to the current delegatee. Source: `EscrowIVotesAdapter.sol:150-165`
+2. **`delegate(uint256[] _tokenIds)`** — Delegates specific tokens to the current delegatee.
+   - Source: `EscrowIVotesAdapter.sol:150-165`
 
-3. **`undelegate(uint256[] _tokenIds)`** — Removes specific tokens from delegation. Source: `EscrowIVotesAdapter.sol:195-209`
+3. **`undelegate(uint256[] _tokenIds)`** — Removes specific tokens from delegation.
+   - Source: `EscrowIVotesAdapter.sol:195-209`
 
 **Delegation tracking**:
-- `delegates(address)` — Returns the delegatee for an address
-- `tokenIsDelegated(uint256)` — Returns whether a token is delegated
-- `getVotes(address)` / `getPastVotes(address, timestamp)` — Returns voting power for a delegate
+- `delegates(address)` — Returns the delegatee for an address.
+- `tokenIsDelegated(uint256)` — Returns whether a specific token is delegated.
+- `getVotes(address)` / `getPastVotes(address, timestamp)` — Returns voting power for a delegate.
 
 ### Step 4: Voting
 
@@ -430,7 +431,7 @@ if (enableUpdateVotingPowerHook) {
 uint256 delegateVP = IEscrowIVotesAdapter(adapter).getPastVotes(delegate, vpSnapshotTs);
 ```
 
-When `enableUpdateVotingPowerHook = false`, the voting power for decomposition is the delegate's `usedVotingPower` stored in the `Voted` event. This was determined by `getPastVotes(delegate, epochStart)` at vote time.
+**Important**: When `enableUpdateVotingPowerHook = false`, the voting power for decomposition is the delegate's `usedVotingPower` stored in the `Voted` event, which was determined by `getPastVotes(delegate, epochStart)` at vote time.
 
 #### Step 2: Identify All Delegators
 
@@ -452,7 +453,7 @@ For each TokensUndelegated(sender, delegatee, tokenIds) event:
     Remove tokenIds from sender's delegated set
 ```
 
-**Event ordering**: `DelegateChanged` updates the address-level mapping (who someone is delegating to). `TokensDelegated`/`TokensUndelegated` events update token-level state. Both must be processed to correctly reconstruct delegation state.
+**Note on event ordering**: The `DelegateChanged` event updates the address-level mapping (who someone is delegating to), while `TokensDelegated`/`TokensUndelegated` events update the token-level state. Both must be processed to correctly reconstruct delegation state.
 
 #### Step 3: Calculate Each Delegator's Voting Power
 
@@ -569,7 +570,7 @@ Alice calls: vote([{gauge: 0x01, weight: 100}])
 - Alice's voting power counts as her own
 - Attribution: Alice: 1000 (100%)
 
-**Contract behavior**: `EscrowIVotesAdapter.delegate(address)` accepts the sender's own address as delegatee. The `tokenIsDelegated` bitmap is set and voting power is checkpointed to the sender.
+**Contract behavior**: `EscrowIVotesAdapter.delegate(address)` accepts the sender's own address as delegatee. The `tokenIsDelegated` bitmap is set, and voting power is checkpointed to the sender.
 
 Source: `EscrowIVotesAdapter.sol:170-191`
 
@@ -599,7 +600,7 @@ At T3: Bob's VP = 1000 (Alice's 500 removed)
 1. If Alice undelegates after epoch start but before vote, her power still counts for Bob's vote
 2. The snapshot for voting power is **epoch start**, not vote end
 
-The contract uses `getPastVotes(_account, currentEpochStart())` to prevent double-voting attacks. See `AddressGaugeVoter.sol:119-146`.
+**Critical note**: The contract uses `getPastVotes(_account, currentEpochStart())` to prevent double-voting attacks. See `AddressGaugeVoter.sol:119-146`.
 
 **For indexer**: Track delegation state at **epoch start** when `enableUpdateVotingPowerHook` is false.
 
@@ -641,9 +642,9 @@ Timeline:
 - T3: Snapshot
 ```
 
-**Question**: Does Alice's late delegation retroactively increase Bob's vote?
+**Key question**: Does Alice's late delegation retroactively increase Bob's vote?
 
-**Answer**: No. Late delegation does NOT retroactively increment votes.
+**Contract behavior**: **NO**, late delegation does NOT retroactively increment votes.
 
 The vote was already cast with Bob's voting power at T1. When Alice delegates at T2:
 1. The delegation is recorded in `EscrowIVotesAdapter`
@@ -732,7 +733,7 @@ Timeline:
 - Gauge B: 0 VP (reset by re-vote)
 - Gauge C: 700 VP (70%)
 
-**Contract behavior**: `vote()` calls `_reset()` first if already voting, then casts new votes.
+**Contract behavior**: As noted above, `vote()` calls `_reset()` first if already voting, then casts new votes.
 
 ---
 
@@ -749,7 +750,7 @@ Epoch N+1:
 - Bob's VP has grown to 1100
 ```
 
-**The behavior depends on `enableUpdateVotingPowerHook`**:
+**The answer depends on `enableUpdateVotingPowerHook`**:
 
 #### When `enableUpdateVotingPowerHook = false` (Secure Mode)
 
@@ -839,7 +840,7 @@ Alice calls: delegate([#1])  // Only delegate token #1
 
 Source: `EscrowIVotesAdapter.sol:150-165`
 
-In the AddressGaugeVoter system, voting power only counts if the tokens are delegated (including self-delegation). Undelegated tokens have zero effective voting power for gauge voting.
+**Important**: In the AddressGaugeVoter system, voting power only counts if the tokens are delegated (including self-delegation). Undelegated tokens have zero effective voting power for gauge voting.
 
 ---
 
@@ -885,7 +886,7 @@ This triggers `EscrowIVotesAdapter.moveDelegateVotes()` which:
 
 ## Processing Stages
 
-The indexer processes data in six stages:
+The indexer processes data in discrete stages with clear inputs and outputs:
 
 ### Stage 1: Event Collection
 
@@ -1051,7 +1052,7 @@ interface EpochSummary {
 
 ## Invariants
 
-The following invariants must hold. Verify them at each processing stage:
+The following invariants must hold and should be verified at each stage:
 
 ### Invariant 1: Total Vote Power Consistency
 
@@ -1707,7 +1708,7 @@ event TokensUndelegated(
 
 ---
 
-## Appendix: Examples
+## Appendix: Example Calculations
 
 ### Example 1: Simple Delegation
 

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Delegate Voting Indexer</title>
+  <link rel="stylesheet" href="/src/styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="header">
+      <div class="header-content">
+        <h1 class="logo">
+          <a href="#/">Delegate Voting Indexer</a>
+        </h1>
+        <nav class="nav">
+          <a href="#/" class="nav-link" data-route="home">Dashboard</a>
+          <a href="#/rankings" class="nav-link" data-route="rankings">Rankings</a>
+          <a href="#/spec" class="nav-link" data-route="spec">Specification</a>
+        </nav>
+      </div>
+    </header>
+
+    <nav class="breadcrumbs" id="breadcrumbs"></nav>
+
+    <main class="main" id="main">
+      <div class="loading">Loading...</div>
+    </main>
+
+    <footer class="footer">
+      <p>Aragon ve-governance delegate voting indexer</p>
+    </footer>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

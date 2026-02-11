@@ -34,7 +34,45 @@ This specification describes an indexing service for Aragon's ve-governance syst
 | **Gauge** | A target that receives votes. Gauges compete for a share of rewards based on votes received. |
 | **Epoch** | A 2-week period that structures the voting cycle. Each epoch has a voting window and a non-voting period. |
 | **Voting Window** | The period within an epoch when votes can be cast. Runs from 1 hour after epoch start to 1 week minus 1 hour. |
-| **Snapshot Timestamp** | The end of the voting window for an epoch — the point at which final vote tallies are computed. |
+| **Snapshot Timestamp** | See [Critical Timestamps](#critical-timestamps) — there are two distinct snapshots with different purposes. |
+| **Voting Power Snapshot** | The timestamp at which delegate voting power is determined. When `enableUpdateVotingPowerHook = false`, this is **epoch start**. |
+| **Vote Finalization Timestamp** | The end of the voting window — the point at which final vote tallies are locked and no more votes can be cast. |
+
+---
+
+## Critical Configuration: `enableUpdateVotingPowerHook`
+
+The AddressGaugeVoter contract has a critical configuration flag that fundamentally changes how voting power is determined and how votes persist:
+
+```solidity
+bool public enableUpdateVotingPowerHook;  // AddressGaugeVoter.sol:60
+```
+
+### Mode Comparison
+
+| Behavior | `enableUpdateVotingPowerHook = false` | `enableUpdateVotingPowerHook = true` |
+|----------|--------------------------------------|-------------------------------------|
+| **Voting Power Source** | `getPastVotes(account, epochStart)` — snapshot at epoch start | `getVotes(account)` — live balance |
+| **Vote Storage** | Per-epoch: `epochVoteData[epochId][account]` | Global: `epochVoteData[0][account]` |
+| **Vote Persistence** | Votes do NOT persist across epochs | Votes persist until reset |
+| **Double-Vote Protection** | Built-in (VP locked at epoch start) | Requires `updateVotingPower` hook |
+| **Late Delegation Effect** | No effect (VP already locked) | No auto-update; delegate must re-vote |
+
+**Contract source**: `AddressGaugeVoter.sol:119-146` (detailed comment explaining the security rationale)
+
+### Which Mode to Use
+
+**`enableUpdateVotingPowerHook = false`** (RECOMMENDED for security):
+- Prevents double-voting attacks where tokens are transferred mid-epoch
+- Voting power is deterministic at epoch start
+- Simpler indexer logic — just query `getPastVotes` at epoch start
+
+**`enableUpdateVotingPowerHook = true`**:
+- Required if the underlying token cannot call `updateVotingPower` on transfers
+- Allows votes to persist across epochs without re-voting
+- More complex, requires careful handling of delegation changes
+
+**For indexer**: Query the on-chain value of `enableUpdateVotingPowerHook` at startup and use the appropriate logic. The algorithms in this spec support both modes.
 
 ---
 
@@ -283,20 +321,76 @@ Within each epoch:
 
 Source: `Clock_v1_2_0.sol:117-187`
 
-### Snapshot Point
+### Critical Timestamps
 
-The **snapshot timestamp** for an epoch is the **end of the voting window**:
+There are **two distinct timestamps** that serve different purposes:
+
+#### 1. Voting Power Snapshot Timestamp
+
+The timestamp at which delegate voting power is determined for the epoch.
+
+**When `enableUpdateVotingPowerHook = false`** (secure mode):
+```
+votingPowerSnapshotTs = epochStart
+```
+
+**When `enableUpdateVotingPowerHook = true`**:
+```
+votingPowerSnapshotTs = block.timestamp (at time of vote)
+```
+
+**Contract source**: `AddressGaugeVoter.sol:144-146`
+```solidity
+uint256 votingPower = enableUpdateVotingPowerHook
+    ? IVotes(ivotesAdapter).getVotes(_account)
+    : IVotes(ivotesAdapter).getPastVotes(_account, currentEpochStart());
+```
+
+#### 2. Vote Finalization Timestamp
+
+The timestamp at which no more votes can be cast for the epoch:
 
 ```
-snapshotTimestamp = epochStart + VOTE_DURATION - VOTE_WINDOW_BUFFER
-                  = epochStart + 604800 - 3600
-                  = epochStart + 601200 seconds
+voteFinalizationTs = epochStart + VOTE_DURATION - VOTE_WINDOW_BUFFER
+                   = epochStart + 604800 - 3600
+                   = epochStart + 601200 seconds
 ```
 
 At this point:
 1. No more votes can be cast for the epoch
 2. All vote events have been emitted
-3. Delegation state is final for the epoch
+3. Final vote tallies are locked
+
+#### Summary Diagram
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                           EPOCH TIMELINE                                    │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  EPOCH START                                      VOTE WINDOW END          │
+│  (VP Snapshot when hook=false)                    (Vote Finalization)      │
+│       │                                                  │                 │
+│       ▼                                                  ▼                 │
+│  ─────●───────────┬─────────────────────────────────────●──────────────── │
+│       │           │                                      │                 │
+│       │     1 hour buffer                                │                 │
+│       │           │                                      │                 │
+│       │           ▼                                      │                 │
+│       │    ┌──────────────────────────────────────┐     │                 │
+│       │    │         VOTING WINDOW                │     │                 │
+│       │    │   (can cast votes during this time)  │     │                 │
+│       │    └──────────────────────────────────────┘     │                 │
+│       │                                                  │                 │
+│       ●─────────────────────────────────────────────────●                 │
+│    epochStart                                    epochStart + 601200       │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+**For indexer**:
+- When `enableUpdateVotingPowerHook = false`: Query voting power at **epoch start**
+- Always collect events up to **vote finalization timestamp**
 
 ---
 
@@ -321,27 +415,45 @@ Output:
 
 #### Step 1: Get Delegate's Total Voting Power
 
-Query the EscrowIVotesAdapter at the snapshot timestamp:
+Query the EscrowIVotesAdapter at the **voting power snapshot timestamp**:
 
 ```solidity
-uint256 snapshotTs = getSnapshotTimestamp(epoch);
-uint256 delegateVP = IEscrowIVotesAdapter(adapter).getPastVotes(delegate, snapshotTs);
+// Determine the correct timestamp based on contract configuration
+uint256 vpSnapshotTs;
+if (enableUpdateVotingPowerHook) {
+    // Live mode: use the delegate's usedVotingPower from their vote event
+    vpSnapshotTs = voteTimestamp;  // timestamp when vote was cast
+} else {
+    // Secure mode: voting power is fixed at epoch start
+    vpSnapshotTs = epochStart;
+}
+
+uint256 delegateVP = IEscrowIVotesAdapter(adapter).getPastVotes(delegate, vpSnapshotTs);
 ```
+
+**Important**: When `enableUpdateVotingPowerHook = false`, the voting power for decomposition is the delegate's `usedVotingPower` stored in the `Voted` event, which was determined by `getPastVotes(delegate, epochStart)` at vote time.
 
 #### Step 2: Identify All Delegators
 
-Collect all addresses that have delegated to this delegate at the snapshot time:
+Collect all addresses that have delegated to this delegate at the **voting power snapshot timestamp**:
 
 ```
+For each DelegateChanged(delegator, fromDelegate, toDelegate) event:
+  If toDelegate == delegate AND timestamp <= vpSnapshotTs:
+    Update delegator → delegate mapping
+  If fromDelegate == delegate AND timestamp <= vpSnapshotTs:
+    Remove delegator → delegate mapping
+
 For each TokensDelegated(sender, delegatee, tokenIds) event:
-  If delegatee == delegate AND timestamp <= snapshotTs:
-    Add sender to delegator set
+  If delegatee == delegate AND timestamp <= vpSnapshotTs:
     Mark each tokenId as delegated by sender
 
 For each TokensUndelegated(sender, delegatee, tokenIds) event:
-  If delegatee == delegate AND timestamp <= snapshotTs:
+  If delegatee == delegate AND timestamp <= vpSnapshotTs:
     Remove tokenIds from sender's delegated set
 ```
+
+**Note on event ordering**: The `DelegateChanged` event updates the address-level mapping (who someone is delegating to), while `TokensDelegated`/`TokensUndelegated` events update the token-level state. Both must be processed to correctly reconstruct delegation state.
 
 #### Step 3: Calculate Each Delegator's Voting Power
 
@@ -390,22 +502,40 @@ Contributions:
 ### Pseudocode
 
 ```python
-def decompose_vote(delegate, gauge, epoch, votes_for_gauge):
-    snapshot_ts = get_snapshot_timestamp(epoch)
+def decompose_vote(delegate, gauge, epoch, votes_for_gauge, enable_hook):
+    """
+    Decompose a delegate's vote into per-delegator contributions.
 
-    # Step 1: Get delegate's total VP
-    delegate_total_vp = get_past_votes(delegate, snapshot_ts)
+    Args:
+        delegate: Address of the delegate who voted
+        gauge: Address of the gauge voted for
+        epoch: Epoch ID
+        votes_for_gauge: Total votes cast for this gauge (from Voted event)
+        enable_hook: Value of enableUpdateVotingPowerHook on-chain
+    """
+
+    # Step 1: Determine the correct timestamp for voting power snapshot
+    if enable_hook:
+        # When hook is enabled, votes use live balance at vote time
+        # The delegate's usedVotingPower in the Voted event is authoritative
+        vp_snapshot_ts = get_vote_timestamp(delegate, epoch)
+    else:
+        # When hook is disabled, voting power is fixed at epoch start
+        vp_snapshot_ts = get_epoch_start(epoch)
+
+    # Get delegate's total VP at the snapshot
+    delegate_total_vp = get_past_votes(delegate, vp_snapshot_ts)
 
     if delegate_total_vp == 0:
         return []  # No voting power means no contributions
 
-    # Step 2: Find all delegators
-    delegators = get_delegators_at_timestamp(delegate, snapshot_ts)
+    # Step 2: Find all delegators at the snapshot timestamp
+    delegators = get_delegators_at_timestamp(delegate, vp_snapshot_ts)
 
     # Step 3 & 4: Calculate each delegator's contribution
     contributions = []
     for delegator in delegators:
-        delegator_vp = get_delegator_voting_power(delegator, delegate, snapshot_ts)
+        delegator_vp = get_delegator_voting_power(delegator, delegate, vp_snapshot_ts)
 
         if delegator_vp > 0:
             contribution = (delegator_vp * votes_for_gauge) // delegate_total_vp
@@ -609,7 +739,7 @@ Timeline:
 
 ### 8. Vote Persistence Across Epochs
 
-**Scenario**: Votes from previous epochs carry forward.
+**Scenario**: Do votes from previous epochs carry forward?
 
 ```
 Epoch N:
@@ -620,22 +750,54 @@ Epoch N+1:
 - Bob's VP has grown to 1100
 ```
 
-**Expected behavior**:
-- Bob's vote for Gauge A persists
-- BUT the voting power used is still 1000 (the amount at vote time)
-- Bob's contribution = 1000 for both epochs
+**The answer depends on `enableUpdateVotingPowerHook`**:
 
-**Contract behavior**: The `usedVotingPower` is stored at vote time and doesn't automatically update. From `AddressGaugeVoter.sol`:
+#### When `enableUpdateVotingPowerHook = false` (Secure Mode)
+
+**Votes do NOT persist across epochs.**
+
+```
+Epoch N:
+- Bob votes → stored in epochVoteData[N][Bob]
+- Bob's contribution for epoch N = 1000
+
+Epoch N+1:
+- epochVoteData[N+1][Bob] is empty
+- Bob has NOT voted for epoch N+1
+- Bob's contribution for epoch N+1 = 0
+```
+
+**Contract behavior**: Votes are stored per-epoch via `getWriteEpochId()`:
 ```solidity
-struct AddressVoteData {
-    mapping(address => uint256) voteWeights;
-    address[] gaugesVotedFor;
-    uint256 usedVotingPower;  // Stored at vote time
-    uint256 lastVoted;
+function getWriteEpochId() public view returns (uint256) {
+    return enableUpdateVotingPowerHook ? 0 : epochId();  // Returns current epoch
 }
 ```
 
-**Critical note**: When `enableUpdateVotingPowerHook = false`, votes are stored per-epoch. When `true`, votes use epoch 0 (global storage).
+**For indexer**: When processing epoch N+1, do NOT assume previous votes carry over. Check `epochVoteData[N+1]` independently.
+
+#### When `enableUpdateVotingPowerHook = true` (Legacy Mode)
+
+**Votes DO persist across epochs.**
+
+```
+Epoch N:
+- Bob votes → stored in epochVoteData[0][Bob] (global)
+- Bob's contribution for epoch N = 1000
+
+Epoch N+1:
+- epochVoteData[0][Bob] still has Bob's vote
+- Bob's contribution for epoch N+1 = 1000 (same as before)
+```
+
+**Contract behavior**: Votes use epoch 0 as global storage:
+```solidity
+function getWriteEpochId() public view returns (uint256) {
+    return enableUpdateVotingPowerHook ? 0 : epochId();  // Returns 0
+}
+```
+
+**For indexer**: When processing epoch N+1, check if the delegate has voted in epoch 0 storage. Their `usedVotingPower` remains fixed until they re-vote or reset.
 
 ---
 
@@ -679,6 +841,46 @@ Alice calls: delegate([#1])  // Only delegate token #1
 Source: `EscrowIVotesAdapter.sol:150-165`
 
 **Important**: In the AddressGaugeVoter system, voting power only counts if the tokens are delegated (including self-delegation). Undelegated tokens have zero effective voting power for gauge voting.
+
+---
+
+### 11. NFT Transfer
+
+**Scenario**: A veNFT is transferred between accounts.
+
+```
+Timeline:
+- T0: Alice owns veNFT #1 (VP: 500), delegated to Bob
+- T1: Alice transfers veNFT #1 to Carol
+- T2: Snapshot
+```
+
+**Expected behavior**:
+- The token is automatically undelegated from Bob
+- If Carol has a delegatee set, the token is auto-delegated to Carol's delegatee
+- If Carol has `autoDelegationDisabled = true` or no delegatee, the token becomes undelegated
+
+**Contract behavior**: The VotingEscrow contract calls `moveDelegateVotes()` on NFT transfer:
+
+```solidity
+// VotingEscrowIncreasing_v1_2_0.sol:676-680
+function moveDelegateVotes(address _from, address _to, uint256 _tokenId) public whenNotPaused {
+    if (msg.sender != lockNFT) revert OnlyLockNFT();
+    LockedBalance memory locked_ = _locked[_tokenId];
+    _moveDelegateVotes(_from, _to, _tokenId, locked_);
+}
+```
+
+This triggers `EscrowIVotesAdapter.moveDelegateVotes()` which:
+1. Undelegates the token from the old owner's delegatee (emits `TokensUndelegated`)
+2. If the new owner has a delegatee and `autoDelegationDisabled = false`, delegates to the new owner's delegatee (emits `TokensDelegated`)
+
+**Source**: `DelegationHelper.sol:127-168`
+
+**For indexer**:
+- Listen for `TokensUndelegated` and `TokensDelegated` events triggered by transfers
+- These events will have the same `tokenId` but different `sender` (old owner) and `delegatee` values
+- Update delegation state accordingly
 
 ---
 
